@@ -1,132 +1,99 @@
-"""OCT Alveo U280 profile with post-boot script
+"""OCT Alveo U280 (UMass) + the 100G ConnectX-5 of pc160-pc163.
+
+Copy of the OCT 'oct-u280' profile (Ubuntu 22.04, tools 2023.2, same post-boot script) with one
+change: on pc160-pc163 the ConnectX-5 (eth3) is added to the experiment LAN, so it can reach the
+U280s of the other nodes (TRex / hexgen on the host NIC). One LAN holds every port:
+U280 eth0/eth1, host eth2 and, on pc160-163, host eth3.
+
+Addresses, node i in the 'nodes' list (i = 0, 1, ...):
+  U280 eth0 192.168.40.(10+i)   U280 eth1 192.168.40.(20+i)
+  host eth2 192.168.40.(30+i)   host eth3 (ConnectX-5) 192.168.40.(40+i)
 """
 
-# Import the Portal object.
 import geni.portal as portal
-# Import the ProtoGENI library.
 import geni.rspec.pg as pg
-# We use the URN library below.
-import geni.urn as urn
-# Emulab extension
-import geni.rspec.emulab
+import geni.rspec.emulab  # noqa: F401  (Emulab extensions)
 
-# Create a portal context.
+HOSTS_WITH_100G = ['pc160', 'pc161', 'pc162', 'pc163']
+
 pc = portal.Context()
-
-# Create a Request object to start building the RSpec.
 request = pc.makeRequestRSpec()
 
-# Pick your image.
 imageList = [('urn:publicid:IDN+emulab.net+image+emulab-ops//UBUNTU22-64-STD', 'UBUNTU 22.04'),
-             ('urn:publicid:IDN+emulab.net+image+emulab-ops//UBUNTU20-64-STD', 'UBUNTU 20.04')] 
+             ('urn:publicid:IDN+emulab.net+image+emulab-ops//UBUNTU20-64-STD', 'UBUNTU 20.04')]
+workflow = ['Vitis', 'Vivado']          # same default as oct-u280
+toolVersion = ['2023.2', '2023.1']
 
-workflow = ['Vitis', 'Vivado']
-
-toolVersion = ['2023.2', '2023.1'] 
-
-pc.defineParameter("nodes","List of nodes",
-                   portal.ParameterType.STRING,"",
-                   longDescription="Comma-separated list of nodes (e.g., pc151,pc153). Please check the list of available nodes within the Mass cluster at https://www.cloudlab.us/cluster-status.php before you specify the nodes.")
-                   
+pc.defineParameter("nodes", "List of nodes",
+                   portal.ParameterType.STRING, "pc162,pc163",
+                   longDescription="Comma-separated list of nodes. pc160-pc163 also get their "
+                   "100G ConnectX-5 in the LAN.")
 pc.defineParameter("workflow", "Workflow",
-                   portal.ParameterType.STRING,
-                   workflow[0], workflow,
-                   longDescription="For Vitis application acceleration workflow, select Vitis. For traditional workflow, select Vivado.")   
-
+                   portal.ParameterType.STRING, workflow[0], workflow)
 pc.defineParameter("toolVersion", "Tool Version",
-                   portal.ParameterType.STRING,
-                   toolVersion[0], toolVersion,
-                   longDescription="Select a tool version. It is recommended to use the latest version for the deployment workflow. For more information, visit https://www.xilinx.com/products/boards-and-kits/alveo/u280.html#gettingStarted")   
-
+                   portal.ParameterType.STRING, toolVersion[0], toolVersion)
 pc.defineParameter("osImage", "Select Image",
-                   portal.ParameterType.IMAGE,
-                   imageList[0], imageList,
-                   longDescription="Supported operating systems are Ubuntu and CentOS.")  
-
+                   portal.ParameterType.IMAGE, imageList[0], imageList)
 pc.defineParameter("remoteDesktop", "Remote Desktop Access",
-                   portal.ParameterType.BOOLEAN, False,
-                   advanced=False,
-                   longDescription="Enable remote desktop access by installing GNOME desktop and VNC server.")
-
-# Optional ephemeral blockstore
+                   portal.ParameterType.BOOLEAN, False)
 pc.defineParameter("tempFileSystemSize", "Temporary Filesystem Size",
-                   portal.ParameterType.INTEGER, 0,advanced=True,
-                   longDescription="The size in GB of a temporary file system to mount on each of your " +
-                   "nodes. Temporary means that they are deleted when your experiment is terminated. " +
-                   "The images provided by the system have small root partitions, so use this option " +
-                   "if you expect you will need more space to build your software packages or store " +
-                   "temporary files.")
-# Instead of a size, ask for all available space. 
-pc.defineParameter("tempFileSystemMax",  "Temp Filesystem Max Space",
-                    portal.ParameterType.BOOLEAN, False,
-                    advanced=True,
-                    longDescription="Instead of specifying a size for your temporary filesystem, " +
-                    "check this box to allocate all available disk space. Leave the size above as zero.")
-
+                   portal.ParameterType.INTEGER, 0, advanced=True,
+                   longDescription="Size in GB of a temporary file system on each node (0 = none).")
+pc.defineParameter("tempFileSystemMax", "Temp Filesystem Max Space",
+                   portal.ParameterType.BOOLEAN, False, advanced=True,
+                   longDescription="Use all free disk space instead of the size above.")
 pc.defineParameter("tempFileSystemMount", "Temporary Filesystem Mount Point",
-                   portal.ParameterType.STRING,"/mydata",advanced=True,
-                   longDescription="Mount the temporary file system at this mount point; in general you " +
-                   "you do not need to change this, but we provide the option just in case your software " +
-                   "is finicky.")  
-                   
-# Retrieve the values the user specifies during instantiation.
-params = pc.bindParameters()        
+                   portal.ParameterType.STRING, "/mydata", advanced=True)
 
-# Check parameter validity.
-  
+params = pc.bindParameters()
+nodeList = [n.strip() for n in params.nodes.split(',') if n.strip()]
+if not nodeList:
+    pc.reportError(portal.ParameterError("Give at least one node", ["nodes"]))
 pc.verifyParameters()
 
 lan = request.LAN()
 lan.best_effort = True
-nodeList = params.nodes.split(',')
-i = 0
-for nodeName in nodeList:
+
+for i, nodeName in enumerate(nodeList):
     host = request.RawPC(nodeName)
-    # UMass cluster
     host.component_manager_id = "urn:publicid:IDN+cloudlab.umass.edu+authority+cm"
-    # Assign to the node hosting the FPGA.
     host.component_id = nodeName
     host.disk_image = params.osImage
-    
-    # Optional Blockstore
+
     if params.tempFileSystemSize > 0 or params.tempFileSystemMax:
         bs = host.Blockstore(nodeName + "-bs", params.tempFileSystemMount)
-        if params.tempFileSystemMax:
-            bs.size = "0GB"
-        else:
-            bs.size = str(params.tempFileSystemSize) + "GB"
+        bs.size = "0GB" if params.tempFileSystemMax else str(params.tempFileSystemSize) + "GB"
         bs.placement = "any"
 
-    cmd = "sudo /local/repository/post-boot.sh {} {} {} >> /local/logs/output_log.txt 2>&1".format(params.workflow, params.toolVersion, params.remoteDesktop)
+    cmd = "sudo /local/repository/post-boot.sh {} {} {} >> /local/logs/output_log.txt 2>&1".format(
+        params.workflow, params.toolVersion, params.remoteDesktop)
     host.addService(pg.Execute(shell="bash", command=cmd))
-  
-    # Since we want to create network links to the FPGA, it has its own identity.
-    fpga = request.RawPC("fpga-" + nodeName)
-    # UMass cluster
-    fpga.component_manager_id = "urn:publicid:IDN+cloudlab.umass.edu+authority+cm"
-    # Assign to the fgpa node
-    fpga.component_id = "fpga-" + nodeName
-    # Use the default image for the type of the node selected. 
-    fpga.setUseTypeDefaultImage()
 
-    # Secret sauce.
+    # the FPGA has its own node identity so its ports can be put in the LAN
+    fpga = request.RawPC("fpga-" + nodeName)
+    fpga.component_manager_id = "urn:publicid:IDN+cloudlab.umass.edu+authority+cm"
+    fpga.component_id = "fpga-" + nodeName
+    fpga.setUseTypeDefaultImage()
     fpga.SubNodeOf(host)
 
-    host_iface1 = host.addInterface()
-    host_iface1.component_id = "eth2"
-    host_iface1.addAddress(pg.IPv4Address("192.168.40." + str(i+30), "255.255.255.0")) 
-    fpga_iface1 = fpga.addInterface()
-    fpga_iface1.component_id = "eth0"
-    fpga_iface1.addAddress(pg.IPv4Address("192.168.40." + str(i+10), "255.255.255.0"))
-    fpga_iface2 = fpga.addInterface()
-    fpga_iface2.component_id = "eth1"
-    fpga_iface2.addAddress(pg.IPv4Address("192.168.40." + str(i+20), "255.255.255.0"))
-    
-    lan.addInterface(fpga_iface1)
-    lan.addInterface(fpga_iface2)
-    lan.addInterface(host_iface1)
-  
-    i+=1
+    host_eth2 = host.addInterface()
+    host_eth2.component_id = "eth2"
+    host_eth2.addAddress(pg.IPv4Address("192.168.40." + str(i + 30), "255.255.255.0"))
+    lan.addInterface(host_eth2)
 
-# Print Request RSpec
+    if nodeName in HOSTS_WITH_100G:            # the ConnectX-5
+        host_eth3 = host.addInterface()
+        host_eth3.component_id = "eth3"
+        host_eth3.addAddress(pg.IPv4Address("192.168.40." + str(i + 40), "255.255.255.0"))
+        lan.addInterface(host_eth3)
+
+    fpga_eth0 = fpga.addInterface()
+    fpga_eth0.component_id = "eth0"
+    fpga_eth0.addAddress(pg.IPv4Address("192.168.40." + str(i + 10), "255.255.255.0"))
+    lan.addInterface(fpga_eth0)
+    fpga_eth1 = fpga.addInterface()
+    fpga_eth1.component_id = "eth1"
+    fpga_eth1.addAddress(pg.IPv4Address("192.168.40." + str(i + 20), "255.255.255.0"))
+    lan.addInterface(fpga_eth1)
+
 pc.printRequestRSpec(request)
